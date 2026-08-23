@@ -231,26 +231,21 @@ function VersionRow({
 
 /* One control per page rather than per row: the store paths on this page all
  * come from one system's artifacts, and switching fetches that system's shard
- * for this attribute — which is why nothing is fetched until it is clicked.
+ * for this attribute — which is why nothing is fetched until it is picked.
+ *
+ * A select rather than the two buttons this started as: the list grows by one
+ * with every system backfilled, and three names do not fit a phone's line.
  *
  * Absent until systems.json says there is more than one system to pick. */
 function SystemPicker({ systems, shown, onPick }) {
   if (!systems || systems.length < 2) return null;
   return html`
-    <span class="syspick" role="group" aria-label="store paths for">
-      ${systems.map(
-        (s) => html`
-          <button
-            key=${s}
-            class=${s === shown ? "syspick-on" : ""}
-            aria-pressed=${s === shown}
-            onClick=${() => onPick(s)}
-          >
-            ${s}
-          </button>
-        `,
-      )}
-    </span>
+    <label class="syspick">
+      <span class="syspick-label">store paths for</span>
+      <select value=${shown} onChange=${(e) => onPick(e.target.value)}>
+        ${systems.map((s) => html`<option key=${s} value=${s}>${s}</option>`)}
+      </select>
+    </label>
   `;
 }
 
@@ -261,8 +256,20 @@ export function PackageDetail({ attr, route, revisions, navigate }) {
   // one system, so the digests, sizes and closures all change with it; the
   // versions and their history do not.
   const systems = useSystems();
-  const [system, setSystem] = useState(null);
-  const shown = system ?? systems?.[0] ?? null;
+  // The URL owns it, so a picked system is shareable, survives a reload, and
+  // walks back with the browser. A `sys` naming a system this build does not
+  // publish — a hand-edited URL, or a link from a build that published more —
+  // falls back to the default rather than fetching a directory that is not
+  // there.
+  const shown = systems?.includes(route.sys)
+    ? route.sys
+    : (systems?.[0] ?? null);
+  // Cleared rather than written when the default is picked, so the common URL
+  // stays the short one. REPLACE, like opening a row: switching system refines
+  // the page you are on, so it should neither stack a history entry per toggle
+  // nor throw away your scroll position.
+  const pickSystem = (s) =>
+    navigate({ sys: s === systems?.[0] ? "" : s }, Nav.REPLACE);
 
   // Both directories follow the picked system, so switching fetches that
   // system's shards and nothing else is ever requested: a reader who never
@@ -354,7 +361,7 @@ export function PackageDetail({ attr, route, revisions, navigate }) {
         <${SystemPicker}
           systems=${systems}
           shown=${shown}
-          onPick=${setSystem}
+          onPick=${pickSystem}
         />
         ${bulkButton}
       </span>

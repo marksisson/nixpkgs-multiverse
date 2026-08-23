@@ -201,15 +201,17 @@ mkMultiverse {
   # unmatched pairs fall back to the real
   # derivation silently (default: "throw")
   fastFallback = "eval";
-  # vendor the data files, skip the pin
-  dataOverride = ./artifacts;
+  # read the data files from a directory instead
+  # of fetching them (see Mirrors below)
+  fetchArtifact = { name, ... }: ./artifacts + "/${name}";
 }
 ```
 
-The index covers x86_64-linux; other systems throw
-rather than substitute foreign binaries. Data arrives through
-`data-pins.json` lazily: nothing is fetched until the first `fast.*` value
-is forced.
+The index covers **x86_64-linux, aarch64-linux and aarch64-darwin**; other
+systems throw rather than substitute foreign binaries, and darwin's coverage
+starts in 2021 ([why](./store-paths.md#a-path-belongs-to-one-system)). Data
+arrives through `data-pins.json` lazily: nothing is fetched until the first
+`fast.*` value is forced, and only your own system's file is fetched.
 
 ### `nix run` cannot take a fake
 
@@ -234,6 +236,56 @@ Hello, world!
 
 $ mvs run hello@2.12.2
 Hello, world!
+```
+
+### Shebang support
+
+Nix's shebang support works perflectly well with the multiverse
+except for some tricky back-ticks.
+
+```bash
+#!/usr/bin/env nix
+#! nix shell nixpkgs#bash
+#! nix ``github:fzakaria/nixpkgs-multiverse#fast.versions.python3."3.8.9".out``
+#! nix ``github:fzakaria/nixpkgs-multiverse#fast.versions.jq."1.6".bin``
+#! nix --command bash
+
+# Python 3.8.9
+python3 --version
+# jq-1.6
+jq --version
+```
+
+You must observe through three rules, each of which is a silent failure when broken:
+
+- **Double backticks around the whole installable.** A version string needs
+  quotes in an attrpath, and Nix's shebang lexer refuses a bare `"` — see [the note in its manual](https://nix.dev/manual/nix/latest/command-ref/new-cli/nix3-shell.html).
+  Backticking only the version splits it into two installables instead. `fast.latest.hello.out` carries no version and needs none of this.
+- **Name the right output.** `jq."1.6".out` is an empty stub; the binary is in `.bin`. Get it wrong and the ambient `jq` answers instead, with no error.
+- **`--command` is not optional**, and it is what makes the reader's login shell irrelevant. Omit it and Nix reads the script path as one more installable.
+
+Unfortunately, `nix-shell` cannot express any of this on the `#!` line since the parser splits on whitespace and strips quotes, so `hello."2.12.2"` is read as `hello.2.12.2`.
+
+Point it at a file instead:
+
+```nix
+# deps.nix
+let
+  mv = import (builtins.fetchTarball
+    "https://github.com/fzakaria/nixpkgs-multiverse/archive/main.tar.gz") { };
+  pkgs = import <nixpkgs> { };
+in
+pkgs.mkShell {
+  packages = [
+    mv.fast.versions.python3."3.8.9"
+    mv.fast.versions.jq."1.6"
+  ];
+}
+```
+
+```bash
+#!/usr/bin/env nix-shell
+#! nix-shell deps.nix -i bash
 ```
 
 ### Attributes with no fast path
@@ -527,3 +579,98 @@ fallback is those same derivations. What no `config` can give `mv.fast.*` is a
 store path to substitute: Hydra never built one, so an unfree package has the
 eval path or nothing. See
 [attributes with no fast path](#attributes-with-no-fast-path).
+
+## Mirrors
+
+Two fetchers decide where a multiverse gets its bytes: `fetchRevision` for
+nixpkgs trees, `fetchArtifact` for the pinned fast-path files. Each is handed
+the record naming what is wanted and returns the fetched thing — a
+`builtins.fetchTree` result for a tree, a path for a file.
+
+```nix
+mv = multiverse.lib.mkMultiverse {
+  system = "x86_64-linux";
+
+  fetchRevision = r: builtins.fetchTree {
+    type = "tarball";
+    url = "https://artifactory.example.org/artifactory/nixpkgs/${r.rev}.tar.gz";
+    inherit (r) narHash;
+  };
+
+  fetchArtifact = { name, tag, narHash, baseUrl }: (builtins.fetchTree {
+    type = "file";
+    url = "https://artifactory.example.org/artifactory/multiverse/${tag}-${name}";
+    inherit narHash;
+  }).outPath;
+};
+```
+
+Returning the fetched thing, rather than arguments for fetching it, is what
+makes a fetcher unrestricted: `fetchurl`, a store path handed in from elsewhere,
+or a directory already on disk are all just values to return.
+
+Both are accepted by `lib.mkMultiverse`, `lib.readLock`, `lib.pinOverlay` and
+the NixOS, nix-darwin and home-manager modules — which is where a mirror is
+usually needed, since that is how a configuration consumes this flake:
+
+```nix
+multiverse = {
+  enable = true;
+  fetchRevision = r: builtins.fetchTree {
+    type = "tarball";
+    url = "https://mirror.example/${r.rev}.tar.gz";
+    inherit (r) narHash;
+  };
+  pins.ripgrep = "13.0.0";
+};
+```
+
+Only the predefined `multiverse.<system>` output cannot take them: it is an
+attrset, not a function.
+
+### Vendoring is a fetcher that fetches nothing
+
+There is no separate option for local artifacts. A directory of
+`outpaths-*.json` and friends is one line:
+
+```nix
+mkMultiverse {
+  system = "x86_64-linux";
+  fetchArtifact = { name, ... }: ./artifacts + "/${name}";
+}
+```
+
+Nothing is fetched and no hash is checked, because the fetcher did neither.
+
+Which systems are served still comes from `data-pins.json`, the only party that
+can speak for what was published. A directory covering fewer systems than the
+pin therefore fails naming the file it has no copy of, rather than with the
+"no store-path index for this system" message an unpublished system gets.
+
+### The two fetchers differ on narHash
+
+`fetchRevision`'s answer is checked: multiverse compares the returned `narHash`
+against the one recorded for that revision — by `build-index.sh` for an indexed
+revision, by `fetch-releases.sh` for a release tip — and throws if they differ. The index records
+digests for the trees those hashes name, so a mirror serving anything else
+resolves to derivations no digest describes. The check sits outside the fetch
+deliberately — it holds however the fetcher got the tree, including mechanisms
+`builtins.fetchTree` never sees.
+
+`fetchArtifact`'s answer is not checked. These files are JSON this evaluation
+parses, not trees that have to match what Hydra built, and a deployment that
+regenerates them with `tools/` holds different bytes legitimately. The pinned
+`narHash` is handed to the fetcher, which decides what to do with it.
+
+### One small file at a time
+
+The default `fetchArtifact` pulls exactly one file per artifact, and only when
+forced: a fast lookup takes `outpaths-<system>.json`,
+`tip-outpaths-<system>.json` and `outs-<system>.json`, and the eval path takes
+none of them.
+
+A fetcher may instead pull a whole tree and index into it — one git ref holding
+every artifact, say. That trades three targeted fetches for one large one and
+hands every x86_64 consumer the aarch64 half, which is exactly what publishing
+[one file per system](./store-paths.md#a-path-belongs-to-one-system) exists to
+avoid. Prefer a per-file mirror.
