@@ -14,6 +14,7 @@ let
 in
 {
   index = evalTest "test-index" ../tests/index.nix;
+  extract = evalTest "test-extract" ../tests/extract.nix;
   flake-at = evalTest "test-flake-at" ../tests/flake-at.nix;
   installables = evalTest "test-installables" ../tests/installables.nix;
   module = evalTest "test-module" ../tests/module.nix;
@@ -52,15 +53,103 @@ in
   # heading text, so renaming a heading breaks links in both and neither says
   # so: the browser just scrolls to the top. The tree is reassembled here
   # because the checker resolves `../` links relative to the file holding them.
+  # The mini-repo carries everything a document can name, not just the prose:
+  # the code, because a link into the tree is exactly the kind that rots —
+  # docs/nix-api.md points at nix/nested-sets.nix, and a reader following that
+  # after the file moved is worse off than one never offered the link — and the
+  # data files, which docs/design.md links to so a reader can go and look at the
+  # shapes it describes. Those cost a rebuild whenever the index moves, which is
+  # a second, and buys the same guarantee for the same reason.
   docs-links = pkgs.runCommand "check-docs-links" { nativeBuildInputs = [ pkgs.python3 ]; } ''
-    mkdir -p repo/docs repo/.github/workflows
+    mkdir -p repo/docs repo/.github/workflows repo/nix repo/tools repo/index
     cp ${../README.md} repo/README.md
     cp ${../LICENSE} repo/LICENSE
     cp ${../multiverse_lotr.jpg} repo/multiverse_lotr.jpg
     cp ${../docs}/*.md ${../docs}/*.svg repo/docs/
     cp ${../.github/workflows}/*.yml repo/.github/workflows/
+    cp ${../nix}/*.nix repo/nix/
+    cp ${../tools}/*.sh ${../tools}/*.py repo/tools/
+    cp ${../revisions.json} repo/revisions.json
+    cp ${../releases.json} repo/releases.json
+    cp ${../data-pins.json} repo/data-pins.json
+    cp ${../index}/*.json repo/index/
     cd repo
     python3 ${../tools/check-links.py} README.md docs/*.md | tee $out
+  '';
+
+  # tools/merge-nested-eval.py, the one piece of --topup that decides what ends
+  # up in the file the join reads. Its inputs are two small JSON documents, so
+  # the whole thing is testable without evaluating a revision — which is the
+  # reason to have the merge in a script of its own rather than inline in the
+  # shell.
+  topup-merge = pkgs.runCommand "check-topup-merge" { nativeBuildInputs = [ pkgs.python3 ]; } ''
+    mkdir -p work && cd work
+
+    # A full evaluation carrying one stale nested row, as a revision indexed
+    # under an older package-set list would.
+    cat > base.json <<'JSON'
+    {"rev":"abc","system":"x86_64-linux","attrCount":3,"errorCount":1,
+     "attrs":{"hello":{"name":"hello-2.12.2","outputs":{"out":"aaaa"}},
+              "ripgrep":{"name":"ripgrep-14.1.0","outputs":{"out":"bbbb"}},
+              "gone.child":{"name":"gone-1.0","outputs":{"out":"cccc"}}}}
+    JSON
+    cat > base.errors.json <<'JSON'
+    {"broken":"error: no","gone.child2":"error: stale"}
+    JSON
+    cat > nested.json <<'JSON'
+    {"rev":"abc","system":"x86_64-linux","attrCount":1,"errorCount":1,
+     "attrs":{"jetbrains.idea":{"name":"idea-2025.3.1","outputs":{"out":"dddd"}}}}
+    JSON
+    cat > nested.errors.json <<'JSON'
+    {"jetbrains.rider":"error: unfree"}
+    JSON
+
+    python3 ${../tools/merge-nested-eval.py} --base base.json --nested nested.json       --out merged.json --base-errors base.errors.json       --nested-errors nested.errors.json --out-errors merged.errors.json
+
+    # A base built for another revision, and a nested run that reported a
+    # top-level attribute: both would corrupt the merged file, so both have to
+    # be refused rather than merged.
+    sed 's/"rev":"abc"/"rev":"zzz"/' nested.json > wrong-rev.json
+    sed 's/jetbrains.idea/hello/' nested.json > stray.json
+    for bad in wrong-rev stray; do
+      if python3 ${../tools/merge-nested-eval.py} --base base.json            --nested $bad.json --out /dev/null 2>/dev/null; then
+        echo "merge accepted $bad.json, which it must refuse" >&2
+        exit 1
+      fi
+    done
+
+    python3 - <<'PY' | tee $out
+    import json
+    m = json.load(open("merged.json"))
+    errors = json.load(open("merged.errors.json"))
+
+    # Top-level rows carry across untouched — the whole point, since deriving
+    # them again is what costs the 52 seconds.
+    assert m["attrs"]["hello"]["outputs"]["out"] == "aaaa", m
+    assert m["attrs"]["ripgrep"]["outputs"]["out"] == "bbbb", m
+
+    # The new list's rows arrive.
+    assert m["attrs"]["jetbrains.idea"]["outputs"]["out"] == "dddd", m
+
+    # And a row from a set no longer on the list is gone, which is why this
+    # replaces the nested half rather than appending to it.
+    assert "gone.child" not in m["attrs"], m
+    assert "gone.child2" not in errors, errors
+
+    assert m["attrCount"] == 3, m
+    assert m["rev"] == "abc" and m["system"] == "x86_64-linux", m
+    assert errors == {"broken": "error: no", "jetbrains.rider": "error: unfree"}, errors
+    assert m["errorCount"] == 2, m
+    print(f"merged {m['attrCount']} attrs, {m['errorCount']} errors")
+    PY
+  '';
+
+  # The retry in tools/fetch-store-paths.py, with the transport stubbed — see
+  # tests/fetch-retry.py for what the policy is and why it is worth pinning.
+  # The script is passed by store path rather than found relative to the test,
+  # since under `nix build` the two arrive as separate store paths.
+  fetch-retry = pkgs.runCommand "check-fetch-retry" { nativeBuildInputs = [ pkgs.python3 ]; } ''
+    python3 ${../tests/fetch-retry.py} ${../tools/fetch-store-paths.py} | tee $out
   '';
 
   # The browser suite over the built site. Everything else here is a pure build;
