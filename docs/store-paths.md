@@ -46,9 +46,10 @@ evaluated for `aarch64-darwin` at all.
 The site follows the same rule. Its aggregate views — reverse dependencies, the
 census, the universe map — are built from one system, and a package page shows
 that system's store paths with a picker to switch between all of them, carried
-in the URL as `?sys=` so a link names the system it was read on. The alternate system's
-metadata lives in its own `meta-<system>/` shards and is fetched only when a
-reader picks it, so a page nobody switches costs exactly what it did before.
+in the URL as `?sys=` so a link names the system it was read on. Each system's
+metadata lives in its own `meta-<system>/` shards, the aggregated one included,
+and an alternate is fetched only when a reader picks it, so a page nobody
+switches costs exactly what it did before.
 
 ## Resolving a pair
 
@@ -139,6 +140,18 @@ Fakes expose them (`fast.latest.ffmpeg.lib`), and the site lists them.
 `out` path's digest**. Keying them by derivation name — as this file did before
 the per-system split — let a name claimed by two packages, or by two
 architectures, hand back somebody else's `lib`.
+
+The site publishes the same maps split by digest, at
+`outs-<system>/<xx>.json` (`tools/shard-outs.py`): around a thousand shards of
+a few KB per system, keyed as the artifact is:
+
+```json
+{ "<out digest>": { "bin": "<digest>", "lib": "<digest>", "man": "<digest>" } }
+```
+
+Every suffix the join recorded is there, minus siblings that repeat the digest
+they are filed under. The meta shards carry each sibling's suffix and size;
+these carry its digest.
 
 The evaluation reports every output of a derivation directly, so nothing here
 depends on some consumer having referenced an output. The site's own
